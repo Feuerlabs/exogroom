@@ -200,13 +200,7 @@ setup_services([{ Name,
     
     io:format("exogroom:setup_services(~p): Router: ~p RouterOpts: ~p~n", 
 	      [ Name, RouterMod, RtOpts ]),
-    
 
-    %% FIXME:
-    %% We probably should have the groom setup its own sideband and router
-    %% processes so that we don't have to run all traffic and management
-    %% messages through self().
-    %%
     %% Fire up the groom.
     case GrMod:start(self(), Name, GrOpts) of
 	{ ok, GrPid } ->
