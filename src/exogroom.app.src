@@ -1,0 +1,12 @@
+{application, exogroom,
+ [
+  {description, "Exogroom app"},
+  {vsn, "1"},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib
+                 ]},
+  {mod, { exogroom_app, []}},
+  {env, []}
+ ]}.
