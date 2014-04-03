@@ -20,5 +20,4 @@
 -callback send_client(pid(), client_id(), data()) ->
     ok  | error().
 
--callback disconnect_client(pid(), client_id()) ->
-    ok.
+%% Disconnect a client by having the groom send it { groom_client_disconnect, self(), Ref }

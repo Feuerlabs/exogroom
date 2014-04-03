@@ -22,9 +22,7 @@
 -define(SERVER, ?MODULE). 
 -define(PORT_DEFAULT, 23). 
 
--record(st, {
-	  
-	 }).
+-record(st, { }).
 
 %%%===================================================================
 %%% API
@@ -178,6 +176,7 @@ handle_client_traffic(ClientSock, CBPid, CBRef, Opts, undefined) ->
 %% Once we've sent off the client connect all to the exogroom process,
 %% we will start receiving messages from the router server process, which
 %% was handed our pid by exogroom.erl.
+%%
 handle_client_traffic(ClientSock, CBPid, CBRef, Opts, Target) ->
     receive 
 	%% bride has connected back to router server.
@@ -194,6 +193,18 @@ handle_client_traffic(ClientSock, CBPid, CBRef, Opts, Target) ->
 	    gen_tcp:send(ClientSock, Data),
 	    handle_client_traffic(ClientSock, CBPid, CBRef, Opts, Target);
 
+	{ router_client_timeout, _From, ClID } ->
+	    io:format("groom_telnet(): Got timeout from bride ~p. Exiting~n", [ ClID]),
+	    gen_tcp:shutdown(ClientSock, read_write),
+	    gen_tcp:close(ClientSock),
+	    exit(normal);
+
+	{ router_client_disconnect, _From, ClID } ->
+	    io:format("groom_telnet(): Router client disconnected ~p. Exiting~n", [ ClID]),
+	    gen_tcp:shutdown(ClientSock, read_write),
+	    gen_tcp:close(ClientSock),
+	    exit(normal);
+
 	{ tcp, _S, Data } ->
 	    io:format("groom_telnet(): Got data from telnet client: ~p, Sending to ~p~n", 
 		      [ Data, CBPid]),
@@ -201,8 +212,19 @@ handle_client_traffic(ClientSock, CBPid, CBRef, Opts, Target) ->
 	    CBPid ! { groom_client_data, self(), CBRef, ClientSock, Data },
 	    handle_client_traffic(ClientSock, CBPid, CBRef, Opts, Target);
 
-	_ -> %% Error or closed.
-	    CBPid ! { groom_client_disconnect, CBRef, ClientSock },
+	{ tcp_closed, _S } ->
+	    io:format("groom_telnet(): Got disconnect from client. Forwarding to router ~p. Exit session~n", 
+		      [ CBPid]),
+
+	    CBPid ! { groom_client_disconnect, self(), CBRef },
+	    gen_tcp:close(ClientSock),
+	    exit(normal);
+
+	Other -> %% Error or closed.
+	    io:format("groom_telnet(): Got unknown message ~p. Exit session~n", 
+		      [Other]),
+	    CBPid ! { groom_client_disconnect, self(), CBRef },
+	    gen_tcp:shutdown(ClientSock, read_write),
 	    gen_tcp:close(ClientSock),
 	    exit(normal)
     end.

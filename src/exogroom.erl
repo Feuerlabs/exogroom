@@ -123,8 +123,10 @@ handle_cast(_Msg, St) ->
 %% An incoming ssh / telnet / http client session was detected.
 %% This will iniiate the marry-me protocol procedure.
 handle_info({groom_client_connect, From, BrideAddr, Service, _Socket}, St) ->
+
     io:format("exogroom:handle_info(): groom_client connect from ~p: ~p -> ~p~n", 
 	      [From, Service, BrideAddr]),
+
     case find_service(Service, St#st.services) of
 	false ->
 	    io:format("WARNING: Unknown service name: ~p~n", [Service]),

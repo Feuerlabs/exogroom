@@ -18,17 +18,19 @@
 %% router_server_plugin callback
 -export([start/1, 
 	 prepare_bride_connection/4,
-	 send_client/3,
-	 disconnect_client/2]).
+	 send_client/3]).
 
 -define(SERVER, ?MODULE). 
+-define(KEY_TIMEOUT_DEFAULT, 5000). 
 -define(PORT_DEFAULT, 4711). 
 -define(IF_ADDR_DEFAULT, {127,0,0,1}). 
 -define(ETS_TABLE, simple_router_clients). 
 -define(ETS_TABLE_KEY, simple_router_client_key).  %% Secondary index is the client key
 
 -record(client, {
+	  pid = nil,
 	  cb_pid = nil,
+	  validated = false,
 	  id = nil,
 	  key = nil,
 	  sock = nil
@@ -36,11 +38,11 @@
 
 -record(client_key, {
 	  key = nil,
+	  timer_ref = nil,
 	  id = nil
 	 }).
 
 -record(st, {
-	  x = nil
 	 }).
 
 %%%===================================================================
@@ -70,10 +72,7 @@ prepare_bride_connection(Pid, CBPid, ClientID, Timeout) ->
 send_client(Pid, ClientID, Data) ->
     gen_server:call(Pid, {router_send_client, ClientID, Data}).
     
-disconnect_client(Pid, ClientID) ->
-    gen_server:call(Pid, {disconnect_client, ClientID}).
-    
-%%%===================================================================
+%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
 
@@ -99,13 +98,16 @@ init(Opts) ->
     IFAddr  = util:get_opt(if_addr, Opts, ?IF_ADDR_DEFAULT),
     Port = util:get_opt(port, Opts, ?PORT_DEFAULT),
 
+    %% Setup a prepare_bride_connection timeout thread that 
+    %% keeps the ets table nice and clean.
+    %%
     case gen_tcp:listen(Port, 
 			[ binary, 
 			  { active, true },
 			  { ip, IFAddr}]) of
 	{ok, ListenSock} ->
 	    spawn_link(fun() -> accept(ListenSock, Opts) end),
-	    {ok, #st{}};
+	    {ok, #st{  }};
 	Err ->
 	    { stop, Err }
     end.
@@ -138,18 +140,6 @@ handle_call({router_send_client, ClientID, Data}, _From, St) ->
     end;
 	    
 
-handle_call({disconnect_client, ClientID}, _From, St) ->
-    case find_client(ClientID) of
-	false ->
-	    {reply, {error, client_not_found}, St};
-
-	{ok, Client} -> 
-	    gen_tcp:shutdown(Client#client.sock, read_write),
-	    gen_tcp:close(Client#client.sock),
-	    delete_client_record(ClientID),
-	    {reply, ok, St}
-    end;
-
 
 handle_call( {router_prepare_bride_connection, 
 	      CBPid, 
@@ -162,7 +152,7 @@ handle_call( {router_prepare_bride_connection,
     %% and use a random number as an client authentication / identification.
     
     Key = integer_to_list(random:uniform(8999999999) + 1000000000), %% NOT SECURE IN ANY WAY.
-    add_client_record(CBPid, ClientID, Key),
+    add_client_record(CBPid, ClientID, Key, ?KEY_TIMEOUT_DEFAULT, self()),
     { reply, {ok, Key }, St};
 
 handle_call(_Request, _From, State) ->
@@ -191,6 +181,22 @@ handle_cast(_Msg, State) ->
 %%                                   {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
+handle_info({ client_connect_timeout, ClientID, Key, CBPid },  St) ->              
+    %% Check if client has already been validated
+    case find_client(ClientID) of
+	{ok, TmpCl} when TmpCl#client.validated =:= false -> %% Update with socket.
+	    io:format("router_server_simple: Bride ~p timed out. Notifying groom ~p ~n", 
+		      [ Key, CBPid ]),
+
+	    CBPid ! { router_client_timeout, self(), ClientID },
+	    delete_client_record(Key),
+	    true;
+
+	_ ->
+	    true
+    end,
+    { noreply, St#st { }};
+
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -222,22 +228,26 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Client ets functions
 %%%===================================================================
-add_client_record(CBPid, ClientID, Key) ->
+add_client_record(CBPid, ClientID, Key, Timeout, TimeoutPid) ->
     io:format("Adding clientID (~p) CB(~p) key (~p)~n", [ClientID, CBPid, Key]),
 
+    TRef = erlang:send_after(Timeout, TimeoutPid, 
+			     { client_connect_timeout, ClientID, Key, CBPid }),
+
     ets:insert(?ETS_TABLE, #client { 
-		  id = ClientID,
-		  key = Key,
-		  cb_pid = CBPid,
-		  sock = nil
-		 }),
+			      id = ClientID,
+			      key = Key,
+			      cb_pid = CBPid,
+			      sock = nil,
+			      validated = false
+			     }),
 
     ets:insert(?ETS_TABLE_KEY,
 	       #client_key { 
 		  key = Key,
+		  timer_ref = TRef,
 		  id = ClientID
 		 }),
-
     ok.
     
 find_client(ClientID) ->
@@ -249,17 +259,20 @@ find_client(ClientID) ->
 	_ -> 
 	    not_found
     end.
-    
 
-validate_client(Key, Socket) ->
+validate_client(Key, Pid, Socket) ->
     %% Use secondary index table to retrieve key->client_ref relation
     io:format("Validating key (~p) on socket (~p)~n", [Key, Socket]),
     case ets:lookup(?ETS_TABLE_KEY, Key) of
-	[ #client_key { id = ClientID } ] ->
+	[ #client_key { id = ClientID, timer_ref = TimerRef } ] ->
 	    case find_client(ClientID) of
 		{ok, TmpCl} -> %% Update with socket.
-		    NewCl = TmpCl#client { sock = Socket },
+		    %% Cancel timer
+		    NewCl = TmpCl#client { sock = Socket, 
+					   pid = Pid, 
+					   validated = true },
 		    ets:insert(?ETS_TABLE, NewCl),
+		    erlang:cancel_timer(TimerRef),
 		    {ok, NewCl};
 
 		_ -> %% Mismatch between ETS_TABLE_KEY and ETS_TABLE
@@ -274,7 +287,13 @@ validate_client(Key, Socket) ->
 
 delete_client_record(Key) ->
     case ets:lookup(?ETS_TABLE_KEY, Key) of
-	[ #client_key { id = ClientID } ] ->
+	[ #client_key { id = ClientID, timer_ref = nil } ] ->
+	    ets:delete(?ETS_TABLE_KEY, Key),
+	    ets:delete(?ETS_TABLE, ClientID),
+	    ok;
+
+	[ #client_key { id = ClientID, timer_ref = TRef } ] ->
+	    erlang:cancel_timer(TRef),
 	    ets:delete(?ETS_TABLE_KEY, Key),
 	    ets:delete(?ETS_TABLE, ClientID),
 	    ok;
@@ -305,11 +324,15 @@ handle_client_key(ClientSock, Opts) ->
 	Other -> %% Illegal traffic
 	    io:format("router_server_simple: ?Session got ~p ~n", [Other]),
 	    exit(normal)
+
+    after ?KEY_TIMEOUT_DEFAULT ->
+	    io:format("router_server_simple: Timed out while waiting for router client key. Exit~n"),
+	    exit(normal)
     end.
 
 
 handle_client_traffic(ClientSock, _Opts, Key) ->
-    Cl = case validate_client(Key, ClientSock) of
+    Cl = case validate_client(Key, self(), ClientSock) of
 	     { ok, TmpCl = #client {} } ->
 		 io:format("router_server_simple(~p): Client Key validated. Notifying ~p ~n",
 			  [self(), TmpCl#client.cb_pid]),
@@ -347,6 +370,27 @@ handle_client_traffic_loop(Cl) ->
 	    gen_tcp:send(Cl#client.sock, Data),
 	    handle_client_traffic_loop(Cl);
 
+	%% Process data from the groom process serving a single incoming
+	%% telnet/http/ssh/whatever client.
+	{ groom_client_disconnect, From, _Ref } ->
+	    io:format("router_server_simple: Got disconnect from groom process ~p. Terminating session.~n", 
+		      [From]),
+
+	    delete_client_record(Cl#client.id),
+	    gen_tcp:shutdown(Cl#client.sock, read_write),
+	    gen_tcp:close(Cl#client.sock),
+	    exit(normal);
+
+	{ tcp_closed, _S } ->
+
+	    io:format("router_server_simple: Got disconnect from router client. Terminating session.~n"),
+	    Cl#client.cb_pid ! { router_client_disconnect, self(), 
+				 Cl#client.id },
+	    
+	    delete_client_record(Cl#client.key),
+	    gen_tcp:close(Cl#client.sock),
+	    exit(normal);
+
 	Other -> %% Error or closed.
 	    io:format("router_server_simple: ??Session got ~p ~n", [Other]),
 	    Cl#client.cb_pid ! { router_client_disconnect, self(), 
@@ -354,3 +398,4 @@ handle_client_traffic_loop(Cl) ->
 	    delete_client_record(Cl#client.key),
 	    exit(normal)
     end.
+
