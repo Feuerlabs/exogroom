@@ -195,6 +195,8 @@ handle_client_traffic(ClientSock, CBPid, CBRef, Opts, Target) ->
 
 	{ router_client_timeout, _From, ClID } ->
 	    io:format("groom_telnet(): Got timeout from bride ~p. Exiting~n", [ ClID]),
+	    gen_tcp:send(ClientSock, "No response from bride.\n"),
+	    
 	    gen_tcp:shutdown(ClientSock, read_write),
 	    gen_tcp:close(ClientSock),
 	    exit(normal);
